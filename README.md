@@ -1,12 +1,3 @@
-# StructBehavior
-
-The code for paper *Granularity-Tunable  Structural Representation  for Behaviors  of  Uncertain Discriminability*.
-
-## Abstract
-
-> Accurate behavior discrimination is essential in domains such as fraud detection, social platforms and cybersecurity, where adversaries deliberately mimic normal activity to evade detection. A key challenge lies in the \emph{uncertain discriminability} of behaviors, namely informative cues may reside in fine-grained attributes or only emerge through coarser relational structures. Existing methods typically operate at a fixed granularity or capture only partial structural aspects, leaving them unable to adapt to this ambiguity.
-In this work, we propose \textsc{StructBehavior}, a granularity-tunable structural representation framework. The framework organizes behaviors into a graph-based hierarchy anchored at three semantic levels: intra-behavior attributes (atomic level), intra-behavior structures (molecular level), and inter-behavior associations (material level). In particular, within our \textsc{StructBehavior}, a structural entropy minimization objective is incorporated to uncover latent hierarchies and strengthen semantic coherence, while a cross-level contrastive learning scheme is employed to align multiple abstraction levels as complementary semantic views. Tunable contributions across different levels enable dynamic adaptation to the most discriminative granularity, implementing the principle of \emph{``fit is best''}. Extensive experiments on real-world datasets that span imbalanced, multi-class, and adversarial scenarios demonstrate that our \textsc{StructBehavior} consistently outperforms competitive baselines, delivering robust and discriminative representations.
-
 ## File structure
 
 Training scripts for 5 datasets mentioned in the paper are located at the root directory, named as `main_foo.py`. `attribute_tree/` and `backbone/` store scripts needed to run training scripts.
