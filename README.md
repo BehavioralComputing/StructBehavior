@@ -1,64 +1,55 @@
-## File structure
+# StructBehavior
 
-Training scripts for 5 datasets mentioned in the paper are located at the root directory, named as `main_foo.py`. `attribute_tree/` and `backbone/` store scripts needed to run training scripts.
+This repository contains data preparation and training code for StructBehavior on five datasets: BAF, Crime, InstaFake, TwiBot-20, and WeiboBot.
 
-`bert/` stores two bert models we used to generate semantic embeddings. They are `bert-base-uncased` and `bert-base-chinese`. More details are included in the *Generate semantic embeddings* chapter.
+## Project layout
 
-Data required by the training scripts are stored under `Data/` folder, where each dataset has an exclusive folder.
-
-File structure under a single dataset's data directory(i.e. `~/Data/foo`) is listed below:
-
-```txt
-- foo
-|---- attribute_pool  # Data for molecular layer
-|---- attribute_tree  # Data for atomic layer
-|---- material_data   # Data for material layer
-|---- preprocessed_data  # Preprocessed raw data
-|---- raw  # Raw data
+```text
+Data/
+  runme.py                 Data preparation entry point
+  BAF/                     Dataset-specific preparation scripts
+  Crime/
+  InstaFake/
+  TwiBot20/
+  WeiboBot/
+attribute_tree/sep_g.py    Atomic-view encoder
+backbone/rgcn.py           Material-view encoder
+backbone/fusion.py         Granularity fusion modules
+backbone/utils_experiment.py
+main_BAF.py                Training entry points
+main_Crime.py
+main_InstaFake.py
+main_Twibot20.py
+main_WeiboBot.py
 ```
 
-## Generate semantic embeddings
+Each dataset directory contains `raw/`, `preprocessed_data/`, `material_data/`, `attribute_pool/`, and `attribute_tree/`. Generated data and model weights are excluded from version control.
 
-We use `bert-base-uncased` for all datasets except `WeiboBot` to generate semantic embeddings of nodes. For `WeiboBot` dataset, we use `bert-base-chinese` instead because of its Chinese content.
+## Environment
 
-Two BERT models can be found here:
+Use a Python environment with PyTorch, PyTorch Geometric (including `torch-sparse`), DGL, NumPy, pandas, and scikit-learn. Data preparation also uses the libraries imported by each dataset script, including Transformers for semantic embeddings. Install compatible versions of PyTorch, PyTorch Geometric, and DGL for your CUDA or CPU environment.
 
-* https://huggingface.co/google-bert/bert-base-uncased
-* https://huggingface.co/google-bert/bert-base-chinese
+Download `bert-base-uncased` and `bert-base-chinese` into `bert/` as required by the data preparation scripts. The model weights are not included in this repository.
 
-The file structure under each bert folder should looks like this(take `bert-base-uncased` as an example):
+## Prepare data
 
-```txt
-- bert-base-uncased
-|---- config.json
-|---- pytorch_model.bin
-|---- tokenizer_config.json
-|---- tokenizer.json
-|---- vocab.txt
+Place the raw datasets in their corresponding `Data/<dataset>/raw/` directories. The source datasets are [TwiBot-20](https://github.com/BunsenFeng/TwiBot-20), [InstaFake](https://github.com/fcakyon/instafake-dataset/tree/master/data/automated-v1.0), [BAF](https://github.com/feedzai/bank-account-fraud/), [WeiboBot](https://github.com/BunsenFeng/Botection/tree/master/dataset), and [Crime](https://catalog.data.gov/dataset/crime-data-from-2020-to-present). Use `automated-v1.0` for InstaFake and `Base.csv` for BAF.
+
+Run the preparation pipeline from the `Data` directory:
+
+```bash
+cd Data
+python runme.py --dataset TwiBot20
 ```
 
-In other words, you should download at least the above files from the two links mentioned before for uncased bert and Chinese bert.
+Replace `TwiBot20` with `BAF`, `Crime`, `InstaFake`, or `WeiboBot` for another dataset. The pipeline runs preprocessing, material-view preparation, molecular-view preparation, and atomic-view preparation in that order. Some datasets require source files or pretrained representations described in their `raw/README.md` files.
 
-## Prepare data for training
+## Train
 
-To prepare data required by the running scripts, the following steps are needed:
+Run training from the repository root after preparing the selected dataset:
 
-1. Download raw data and put them in `raw/` folder, whose link will be given below;
-2. Download BERT from the links above and organize them in right structure;
-3. Preprocess raw data by running `runme.py --dataset foo` under `Data/` folder. Parameters following `--dataset` should be same as dataset folder name under `Data/` folder(e.g. `--dataset InstaFake`).
+```bash
+python main_Twibot20.py
+```
 
-**PS:** We recommend using `runme.py` to run all the scripts as a whole, because running scripts separately may suffer from path issues.
-
-### Raw data links
-
-* **Twibot-20**: https://github.com/BunsenFeng/TwiBot-20;
-* **InstaFake**: https://github.com/fcakyon/instafake-dataset/tree/master/data/automated-v1.0;
-* **BAF**: https://github.com/feedzai/bank-account-fraud/;
-* **WeiboBot**: https://github.com/BunsenFeng/Botection/tree/master/dataset;
-* **Crime**: https://catalog.data.gov/dataset/crime-data-from-2020-to-present.
-
-**PS:** For **InstaFake** dataset, you should download raw data under `automated-v1.0/` folder, **NOT** under `fake-v-1.0`. For **BAF** dataset, you should download `Base.csv` among the csvs provided.
-
-## Cite our paper as
-
-`#TODO`
+The five `main_*.py` scripts expose dataset-specific arguments through `--help`. `--fusion` selects `concat`, `adaptive`, `global_learnable`, or `hybrid`; the default is `hybrid`. The training scripts correspond to the revised implementation. Their default hyperparameters are starting configurations and have not been revalidated for every dataset in this repository.
