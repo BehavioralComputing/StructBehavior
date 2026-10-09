@@ -100,9 +100,8 @@ class FACNConv(MessagePassing):
         self.rcm = rcm
         self.root_weight = nn.Linear(in_channels, out_channels)
         self.weight = Parameter(torch.Tensor(num_relations, in_channels, out_channels))
-        self.relation_weight = nn.Linear(
-            num_relations * out_channels, num_relations * out_channels
-        )
+        # One softmax vector per layer, shared across nodes and coordinates.
+        self.relation_logits = Parameter(torch.zeros(num_relations))
         self.att = Parameter(torch.Tensor(num_relations, out_channels * 2, 1))
         self.relu = nn.LeakyReLU()
         self.tanh = nn.Tanh()
@@ -113,10 +112,9 @@ class FACNConv(MessagePassing):
     def reset_parameters(self):
         torch.nn.init.kaiming_uniform_(self.root_weight.weight)
         torch.nn.init.kaiming_uniform_(self.weight)
-        torch.nn.init.kaiming_uniform_(self.relation_weight.weight)
+        torch.nn.init.zeros_(self.relation_logits)
         torch.nn.init.kaiming_uniform_(self.att)
         torch.nn.init.zeros_(self.root_weight.bias)
-        torch.nn.init.zeros_(self.relation_weight.bias)
 
     def forward(self, x, edge_index, edge_type, return_attention=False):
         root_x = self.root_weight(x)
@@ -133,18 +131,12 @@ class FACNConv(MessagePassing):
             )
             x_relation.append(x_r)
         if self.rcm:
-            total_x_relation = torch.cat(x_relation, dim=1)
-            relation_weight = self.relation_weight(total_x_relation)
-            relation_weight = self.relu(relation_weight)
-            relation_weight = relation_weight.view(
-                -1, self.num_relations, self.out_channels
-            )
-            relation_weight = torch.softmax(relation_weight, dim=1)
-            total_x_relation = total_x_relation.view(
-                -1, self.num_relations, self.out_channels
-            )
-
-            x = torch.sum(total_x_relation * relation_weight, dim=1) + root_x
+            relation_coefficients = torch.softmax(self.relation_logits, dim=0)
+            messages = torch.stack(x_relation, dim=1)
+            x = torch.sum(
+                messages * relation_coefficients.view(1, self.num_relations, 1),
+                dim=1,
+            ) + root_x
         else:
             x = torch.sum(torch.stack(x_relation), dim=0) + root_x
         if return_attention:

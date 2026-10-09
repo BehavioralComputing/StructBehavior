@@ -15,6 +15,8 @@ Data/
 attribute_tree/sep_g.py    Atomic-view encoder
 backbone/rgcn.py           Material-view encoder
 backbone/fusion.py         Granularity fusion modules
+backbone/relation.py       Node-shared molecular relation coefficients
+backbone/training.py       Training mini-batch index/label selection
 backbone/utils_experiment.py
 main_BAF.py                Training entry points
 main_Crime.py
@@ -52,4 +54,10 @@ Run training from the repository root after preparing the selected dataset:
 python main_Twibot20.py
 ```
 
-The five `main_*.py` scripts expose dataset-specific arguments through `--help`. `--fusion` selects `concat`, `adaptive`, `global_learnable`, or `hybrid`; the default is `hybrid`. The training scripts correspond to the revised implementation. Their default hyperparameters are starting configurations and have not been revalidated for every dataset in this repository.
+The five `main_*.py` scripts expose dataset-specific arguments through `--help`. `--fusion` selects `concat`, `adaptive`, `global_learnable`, or `hybrid`; the default is `hybrid`. `--batch_size` controls the training-instance batches used by CE, FSA, and RA (default: 256). Shared graph propagation retains the unlabeled context permitted by the transductive setting, while contrastive positives and negatives come only from the selected training batch. FSA and RA each use two independent endpoint projection heads.
+
+Molecular and material layers use learned relation coefficients normalized by a softmax across relation types and shared across nodes. Training selects model parameters using the validation primary metric (macro-F1 for Crime, AUC for BAF, and F1 for the other datasets), restores that checkpoint, and evaluates the test split once. `--save_top_k` retains validation-ranking summaries; it does not trigger additional test evaluations.
+
+## Revision status
+
+The October 10, 2026 code update aligns the implementation with the revised manuscript's training-batch scope, relation coefficients, projection heads, and validation-selected final testing. This update has not rerun the dataset experiments and does not establish that the manuscript's reported numerical results were produced by this code revision. Default hyperparameters are starting configurations and have not been revalidated for every dataset in this repository. Checkpoints from earlier versions require retraining because the relation parameters and projection-head architecture have changed.

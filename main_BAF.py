@@ -1,5 +1,7 @@
 from attribute_tree.sep_g import SEP_G
 from backbone.rgcn import FACNConv as RGCNConv
+from backbone.relation import SharedRelationHeteroConv
+from backbone.training import training_selection
 from backbone.fusion import (
     AdaptiveGranularityFusion,
     GlobalLearnableFusion,
@@ -78,14 +80,14 @@ class RGCN(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.rel_names = args.rel_names
-        self.conv1 = dglnn.HeteroGraphConv(
+        self.conv1 = SharedRelationHeteroConv(
             {
                 rel: dglnn.GraphConv(args.input_dim, args.input_dim)
                 for rel in self.rel_names
             },
             aggregate="sum",
         )
-        self.conv2 = dglnn.HeteroGraphConv(
+        self.conv2 = SharedRelationHeteroConv(
             {
                 rel: dglnn.GraphConv(args.input_dim, args.input_dim)
                 for rel in self.rel_names
@@ -133,7 +135,7 @@ class RGATLite(nn.Module):
         num_heads = 2
         head_dim = in_dim // num_heads
 
-        self.conv1 = dglnn.HeteroGraphConv(
+        self.conv1 = SharedRelationHeteroConv(
             {
                 rel: dglnn.GATConv(
                     in_dim, head_dim, num_heads, feat_drop=0.5, attn_drop=0.5
@@ -144,7 +146,7 @@ class RGATLite(nn.Module):
         )
         self.norm1 = nn.LayerNorm(in_dim)
 
-        self.conv2 = dglnn.HeteroGraphConv(
+        self.conv2 = SharedRelationHeteroConv(
             {
                 rel: dglnn.GATConv(
                     in_dim, head_dim, num_heads, feat_drop=0.5, attn_drop=0.5
@@ -370,12 +372,23 @@ class StructBehavior(nn.Module):
             nn.LeakyReLU(),
             nn.Linear(self.args.hidden_dim, self.args.num_classes),
         )
-        self.proj_material_molecular = nn.Sequential(
+        # The two alignment paths each have independent endpoint heads.
+        self.proj_ra_material = nn.Sequential(
             nn.Linear(self.args.hidden_dim, self.args.proj_dim),
             nn.LeakyReLU(),
             nn.Linear(self.args.proj_dim, self.args.hidden_dim),
         )
-        self.proj_molecular_atomic = nn.Sequential(
+        self.proj_ra_molecular = nn.Sequential(
+            nn.Linear(self.args.hidden_dim, self.args.proj_dim),
+            nn.LeakyReLU(),
+            nn.Linear(self.args.proj_dim, self.args.hidden_dim),
+        )
+        self.proj_fsa_molecular = nn.Sequential(
+            nn.Linear(self.args.hidden_dim, self.args.proj_dim),
+            nn.LeakyReLU(),
+            nn.Linear(self.args.proj_dim, self.args.hidden_dim),
+        )
+        self.proj_fsa_atomic = nn.Sequential(
             nn.Linear(self.args.hidden_dim, self.args.proj_dim),
             nn.LeakyReLU(),
             nn.Linear(self.args.proj_dim, self.args.hidden_dim),
@@ -393,25 +406,30 @@ class StructBehavior(nn.Module):
             F.cross_entropy(logits, targets) + F.cross_entropy(logits.t(), targets)
         )
 
-    def forward(self, batch):
+    def forward(self, batch, instance_idx=None, split="val"):
+        # Shared graph propagation may use unlabeled transductive context.
         h_material = self.backbone(batch["data"])
         h_material = h_material[: self.args.node_num, :]
-
         h_molecular = self.attribute_pool_layer(batch["graph"])
-
         h_atomic = self.attribute_layer(batch)
 
-        loss_material_molecular = self.infonce_loss(
-            self.proj_material_molecular(h_material),
-            self.proj_material_molecular(h_molecular),
-            self.args.temperature,
-        )
-        loss_molecular_atomic = self.infonce_loss(
-            self.proj_molecular_atomic(h_molecular),
-            self.proj_molecular_atomic(h_atomic),
-            self.args.temperature,
-        )
+        if self.training:
+            selected_idx, selected_labels = training_selection(
+                self.idx, instance_idx, h_atomic.device, self.args.node_num
+            )
+        else:
+            if split not in ("val", "test"):
+                raise ValueError("Evaluation split must be 'val' or 'test'.")
+            selected_idx = torch.as_tensor(
+                self.idx[f"{split}_idx"], dtype=torch.long, device=h_atomic.device
+            )
+            selected_labels = self.idx[f"{split}_label"].to(h_atomic.device)
 
+        # Align and classify only the selected instances, with the same order
+        # on all three views and the corresponding supervised labels.
+        h_atomic = h_atomic.index_select(0, selected_idx)
+        h_molecular = h_molecular.index_select(0, selected_idx)
+        h_material = h_material.index_select(0, selected_idx)
         gw = None
         if self.args.fusion == "concat":
             fused_feat = torch.cat([h_atomic, h_molecular, h_material], dim=1)
@@ -419,65 +437,51 @@ class StructBehavior(nn.Module):
             fused_feat, gw = self.fusion(
                 h_atomic, h_molecular, h_material, return_weights=True
             )
+        logits = self.classifier(fused_feat)
+        loss_ce = F.cross_entropy(logits, selected_labels)
 
         if self.training:
-
-            train_out = fused_feat[self.idx["train_idx"]]
-            train_out = self.classifier(train_out)
-            loss_ce = F.cross_entropy(train_out, self.idx["train_label"])
+            # Positives and negatives are confined to the training mini-batch.
+            loss_ra = self.infonce_loss(
+                self.proj_ra_material(h_material),
+                self.proj_ra_molecular(h_molecular),
+                self.args.temperature,
+            )
+            loss_fsa = self.infonce_loss(
+                self.proj_fsa_molecular(h_molecular),
+                self.proj_fsa_atomic(h_atomic),
+                self.args.temperature,
+            )
             loss = (
                 loss_ce
-                + loss_material_molecular * self.args.lambda_ra
-                + loss_molecular_atomic * self.args.lambda_fsa
+                + self.args.lambda_ra * loss_ra
+                + self.args.lambda_fsa * loss_fsa
             )
-
             if gw is not None and self.args.lambda_gate > 0:
-                train_gw = gw[self.idx["train_idx"]]
-                loss = loss + self.args.lambda_gate * ((train_gw - 1.0) ** 2).mean()
-
+                loss = loss + self.args.lambda_gate * ((gw - 1.0) ** 2).mean()
             return loss
-        else:
-            if self.args.fusion != "concat":
+
+        labels_np = selected_labels.detach().cpu().numpy()
+        pred = torch.argmax(logits, dim=1).detach().cpu().numpy()
+        metrics = {
+            "acc": accuracy_score(labels_np, pred),
+            "loss": loss_ce.item(),
+            "f1": f1_score(labels_np, pred, average="binary", zero_division=0),
+            "recall": recall_score(labels_np, pred, average="binary", zero_division=0),
+            "precision": precision_score(labels_np, pred, average="binary", zero_division=0),
+        }
+        probabilities = F.softmax(logits, dim=1)[:, 1].detach().cpu().numpy()
+        metrics["auc"] = roc_auc_score(labels_np, probabilities)
+        if split == "test":
+            if gw is not None:
                 self.granularity_weights.append(gw.detach().cpu())
-
-            val_out = fused_feat[self.idx["val_idx"]]
-            val_out = self.classifier(val_out)
-            val_loss = F.cross_entropy(val_out, self.idx["val_label"])
-            val_label_np = self.idx["val_label"].cpu().numpy()
-            val_pred = torch.argmax(val_out, dim=1).cpu().numpy()
-            val_acc = accuracy_score(val_label_np, val_pred)
-            val_prob = F.softmax(val_out, dim=1)[:, 1].detach().cpu().numpy()
-            val_auc = roc_auc_score(val_label_np, val_prob)
-
-            test_out = fused_feat[self.idx["test_idx"]]
-            test_out = self.classifier(test_out)
-            test_label = self.idx["test_label"].cpu().numpy()
-            test_pred = torch.argmax(test_out, dim=1).cpu().numpy()
-
-            test_acc = accuracy_score(test_label, test_pred)
-            test_f1 = f1_score(test_label, test_pred)
-            test_recall = recall_score(test_label, test_pred)
-            test_precision = precision_score(test_label, test_pred)
-
-            test_prob = F.softmax(test_out, dim=1)[:, 1].detach().cpu().numpy()
-            auc_roc = roc_auc_score(test_label, test_prob)
-
             self.test_results.append(
-                [test_acc, test_f1, test_recall, test_precision, auc_roc]
+                [metrics["acc"], metrics["f1"], metrics["recall"], metrics["precision"]] + [metrics["auc"]]
             )
-            return (
-                val_acc,
-                val_loss.item(),
-                val_auc,
-                test_acc,
-                test_precision,
-                test_recall,
-                test_f1,
-                auc_roc,
-            )
+        return metrics
 
     def get_test_results(self):
-        return self.test_results
+        """Results from final evaluation after validation checkpoint selection."""
         return self.test_results
 
 
@@ -581,25 +585,10 @@ class Trainer(object):
         }
         summarize_split(label, train_idx, val_idx, test_idx)
 
-    def organize_val_log(self, val_loss, val_acc, val_auc, epoch):
-        if val_loss < self.best_loss:
-            self.best_loss_acc = val_acc
-            self.best_loss = val_loss
-            self.best_loss_epoch = epoch
-            self.patience = 0
-        else:
-            self.patience += 1
-
-        if val_acc > self.best_acc:
-            self.best_acc = val_acc
-            self.best_acc_loss = val_loss
-            self.best_acc_epoch = epoch
-
-        if val_auc > self.best_val_auc:
-            self.best_val_auc = val_auc
-            self.best_val_auc_epoch = epoch
-
     def train(self):
+        self.args.batch_size = getattr(self.args, "batch_size", 256)
+        if self.args.epochs < 1 or self.args.batch_size < 1:
+            raise ValueError("epochs and batch_size must be positive.")
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=self.args.lr,
@@ -608,104 +597,96 @@ class Trainer(object):
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=16, eta_min=0
         )
-        print(
-            f"Training with lambda_ra={self.args.lambda_ra}, lambda_fsa={self.args.lambda_fsa}, lr={self.args.lr}"
+        batch = {
+            "data": self.data.to(self.args.device),
+            "graph": self.graph,
+            "x_list": self.x_list.to(self.args.device),
+            "knn_edge_index_list": self.knn_edge_index_list,
+            "layer_data": self.layer_data,
+        }
+        train_idx = torch.as_tensor(
+            self.idx["train_idx"], dtype=torch.long, device=self.args.device
         )
-
-        val_accs = []
-        val_losses = []
-        val_aucs = []
+        if train_idx.numel() == 0:
+            raise ValueError("The training split is empty.")
+        primary_metric = "auc"
+        best_score = float("-inf")
+        best_state = None
+        self.validation_history = []
+        print(
+            f"Training with lambda_ra={self.args.lambda_ra}, "
+            f"lambda_fsa={self.args.lambda_fsa}, lr={self.args.lr}, "
+            f"batch_size={self.args.batch_size}"
+        )
 
         for epoch in range(self.args.epochs):
             self.model.train()
-            batch = {
-                "data": self.data.to(self.args.device),
-                "graph": self.graph,
-                "x_list": self.x_list.to(self.args.device),
-                "knn_edge_index_list": self.knn_edge_index_list,
-                "layer_data": self.layer_data,
-            }
-            self.optimizer.zero_grad()
-            loss = self.model(batch)
-            loss.backward()
-            self.optimizer.step()
+            order = torch.randperm(train_idx.numel(), device=train_idx.device)
+            shuffled_idx = train_idx[order]
+            total_loss = 0.0
+            for selected_idx in shuffled_idx.split(self.args.batch_size):
+                self.optimizer.zero_grad()
+                loss = self.model(batch, instance_idx=selected_idx)
+                loss.backward()
+                self.optimizer.step()
+                total_loss += loss.item() * selected_idx.numel()
             self.scheduler.step()
 
-            (
-                val_acc,
-                val_loss,
-                val_auc,
-                test_acc,
-                test_precision,
-                test_recall,
-                test_f1,
-                auc_roc,
-            ) = self.eval(batch)
+            # Checkpoint selection and early stopping use validation only.
+            val_metrics = self.eval(batch, split="val")
+            self.validation_history.append({"epoch": epoch, **val_metrics})
+            score = val_metrics[primary_metric]
             eta_str = ""
             if self.args.fusion == "hybrid":
                 eta_str = ", eta: %.4f" % self.model.fusion.get_eta().item()
             print(
-                "epoch: %d, val_acc: %.4f, val_loss: %.4f, val_auc: %.4f, test_acc: %.4f, test_precision: %.4f, test_recall: %.4f, test_f1: %.4f, auc_roc: %.4f%s"
-                % (
-                    epoch,
-                    val_acc,
-                    val_loss,
-                    val_auc,
-                    test_acc,
-                    test_precision,
-                    test_recall,
-                    test_f1,
-                    auc_roc,
-                    eta_str,
-                )
+                f"epoch: {epoch}, train_loss: {total_loss / train_idx.numel():.4f}, "
+                f"val_acc: {val_metrics['acc']:.4f}, val_loss: {val_metrics['loss']:.4f}, "
+                f"val_{primary_metric}: {score:.4f}{eta_str}"
             )
-
-            self.organize_val_log(val_loss, val_acc, val_auc, epoch)
-            val_accs.append(val_acc)
-            val_losses.append(val_loss)
-            val_aucs.append(val_auc)
+            if score > best_score:
+                best_score = score
+                self.best_epoch = epoch
+                # Clone tensors so later optimizer updates cannot mutate this checkpoint.
+                best_state = {
+                    name: value.detach().cpu().clone()
+                    for name, value in self.model.state_dict().items()
+                }
+                self.patience = 0
+            else:
+                self.patience += 1
             if self.patience > self.args.patience:
                 break
 
-        val_aucs_np = np.array(val_aucs)
-        best_idx = int(np.argmax(val_aucs_np))
-        test_results = self.model.get_test_results()
-        best_result = test_results[best_idx]
-        print("=== Best epoch by val_auc ===")
+        if best_state is None:
+            raise RuntimeError("No finite validation metric was available for selection.")
+        self.model.load_state_dict(best_state)
+        self.best_validation_metric = best_score
+        # Test is evaluated once, only after restoring the selected checkpoint.
+        self.final_test_metrics = self.eval(batch, split="test")
         print(
-            "best_epoch: %d, best_val_auc: %.4f, test_acc_at_best: %.4f, test_f1_at_best: %.4f, test_auc_at_best: %.4f"
-            % (
-                best_idx,
-                val_aucs_np[best_idx],
-                best_result[0],
-                best_result[1],
-                best_result[4],
+            f"best_epoch: {self.best_epoch}, best_val_{primary_metric}: {best_score:.4f}, "
+            + ", ".join(
+                f"test_{name}: {value:.4f}"
+                for name, value in self.final_test_metrics.items()
+                if name != "loss"
             )
         )
-
-        top_k = min(self.save_top_k, len(val_aucs_np))
-        top_auc_index = val_aucs_np.argsort()[::-1][:top_k]
-        print("=== top-%d results by val_auc ===" % top_k)
-        for idx in top_auc_index:
-            result = test_results[idx]
+        # Retain the legacy top-k option for validation summaries, never extra tests.
+        top_k = min(self.save_top_k, len(self.validation_history))
+        for item in sorted(
+            self.validation_history, key=lambda row: row[primary_metric], reverse=True
+        )[:top_k]:
             print(
-                "epoch: %d, val_auc: %.4f, test_acc: %.4f, test_f1: %.4f, test_recall: %.4f, test_precision: %.4f, auc_roc: %.4f"
-                % (
-                    idx,
-                    val_aucs_np[idx],
-                    result[0],
-                    result[1],
-                    result[2],
-                    result[3],
-                    result[4],
-                )
+                f"validation_rank epoch: {item['epoch']}, "
+                f"val_{primary_metric}: {item[primary_metric]:.4f}"
             )
+        return self.final_test_metrics[primary_metric]
 
-        return best_result[4]
-
-    def eval(self, batch):
+    @torch.no_grad()
+    def eval(self, batch, split="val"):
         self.model.eval()
-        return self.model(batch)
+        return self.model(batch, split=split)
 
 
 if __name__ == "__main__":
@@ -728,6 +709,10 @@ if __name__ == "__main__":
     parser.add_argument("--input_dim", type=int, default=128)
     parser.add_argument("--hidden_dim", type=int, default=32)
     parser.add_argument("--proj_dim", type=int, default=16)
+    parser.add_argument(
+        "--batch_size", type=int, default=256,
+        help="Training instances per CE/FSA/RA mini-batch.",
+    )
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--patience", type=int, default=80)
     parser.add_argument("--save_top_k", type=int, default=6)
