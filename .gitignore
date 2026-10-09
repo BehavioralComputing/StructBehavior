@@ -13,6 +13,9 @@ runs/
 *.pickle
 *.pt
 *.pth
+Data/TwiBot20/material_data/material_graph_manifest.json
+Data/TwiBot20/material_data/.material_graph_build.lock
+Data/TwiBot20/material_data/.material_graph_staging_*/
 
 Data/**/raw/*
 !Data/**/raw/README.md

@@ -8,6 +8,7 @@ from backbone.fusion import (
     HybridGranularityFusion,
 )
 from backbone.utils_experiment import set_model_seed, summarize_split
+from Data.TwiBot20.material_data.build_graph import load_prepared_material_graph
 
 import torch
 import torch.nn as nn
@@ -54,22 +55,47 @@ def edge_mask(edge_index, edge_attr, pe):
 
 
 def relational_undirected(edge_index, edge_type):
-    device = edge_index.device
-    relation_num = edge_type.max() + 1
-    edge_index = edge_index.clone()
-    edge_type = edge_type.clone()
-    r_edge = []
-    for i in range(relation_num):
-        e1 = edge_index[:, edge_type == i].unique(dim=1)
-        e2 = e1.flip(0)
-        edges = torch.cat((e1, e2), dim=1)
-        r_edge.append(edges)
-    edge_type = torch.cat(
-        [torch.tensor([i] * e.shape[1]) for i, e in enumerate(r_edge)], dim=0
-    ).to(device)
-    edge_index = torch.cat(r_edge, dim=1)
+    """Undirected native support, without self-loops or repeated relation triplets."""
+    keep = edge_index[0] != edge_index[1]
+    edges = edge_index[:, keep]
+    types = edge_type[keep]
+    triplets = torch.cat((edges.t(), types[:, None]), dim=1)
+    reverse = triplets[:, [1, 0, 2]]
+    triplets = torch.cat((triplets, reverse), dim=0).unique(dim=0)
+    return triplets[:, :2].t().contiguous(), triplets[:, 2].contiguous()
 
-    return edge_index, edge_type
+
+def load_material_graph_data(data_dir, graph_mode="augmented"):
+    """Require the prepared native-plus-feature graph for the full model.
+
+    Native-only support is available solely as an explicit construction ablation.
+    Missing or stale augmented artifacts never fall back to the native graph.
+    """
+    if graph_mode == "augmented":
+        return load_prepared_material_graph(data_dir)
+    if graph_mode != "native":
+        raise ValueError("material_graph must be 'augmented' or 'native'.")
+    edge_index = torch.load(
+        os.path.join(data_dir, "edge_index.pt"), map_location="cpu", weights_only=True
+    )
+    edge_type = torch.load(
+        os.path.join(data_dir, "edge_type.pt"), map_location="cpu", weights_only=True
+    )
+    if (
+        not isinstance(edge_index, torch.Tensor)
+        or not isinstance(edge_type, torch.Tensor)
+        or edge_index.dtype != torch.long
+        or edge_type.dtype != torch.long
+        or edge_index.ndim != 2
+        or edge_index.shape[0] != 2
+        or edge_type.ndim != 1
+        or edge_index.shape[1] != edge_type.shape[0]
+        or (edge_index < 0).any()
+        or (edge_type < 0).any()
+    ):
+        raise ValueError("Native edge files must contain matching nonnegative int64 tensors.")
+    edge_index, edge_type = relational_undirected(edge_index, edge_type)
+    return edge_index, edge_type, {"graph_mode": "native", "construction_ablation": True}
 
 
 class Attribute_Layer(nn.Module):
@@ -529,7 +555,14 @@ class Trainer(object):
         self.test_results = []
 
     def load_data(self):
-
+        whole_raw_path = os.path.join(PWD, "Data/TwiBot20/material_data")
+        edge_index, edge_type, self.material_graph_manifest = load_material_graph_data(
+            whole_raw_path, getattr(self.args, "material_graph", "augmented")
+        )
+        if edge_type.numel() == 0:
+            raise ValueError("The material graph has no non-self edges.")
+        # Include the added feature-neighbor relation in every material layer.
+        self.args.num_relations = int(edge_type.max().item()) + 1
         attri_raw_path = os.path.join(PWD, "Data/TwiBot20/attribute_tree/mid")
         tree_path = os.path.join(
             PWD,
@@ -562,21 +595,16 @@ class Trainer(object):
         map_data = pd.read_csv(map_data_path)
         args.map_data = map_data[0:11826]
 
-        whole_raw_path = os.path.join(PWD, "Data/TwiBot20/material_data")
-        label = torch.load(os.path.join(whole_raw_path, "label.pt"))
+        label = torch.load(os.path.join(whole_raw_path, "label.pt"), map_location="cpu")
         x = torch.cat(
             [
-                torch.load(os.path.join(whole_raw_path, "num_properties_tensor.pt")),
-                torch.load(os.path.join(whole_raw_path, "tweets_tensor.pt")),
-                torch.load(os.path.join(whole_raw_path, "cat_properties_tensor.pt")),
-                torch.load(os.path.join(whole_raw_path, "des_tensor.pt")),
+                torch.load(os.path.join(whole_raw_path, "num_properties_tensor.pt"), map_location="cpu"),
+                torch.load(os.path.join(whole_raw_path, "tweets_tensor.pt"), map_location="cpu"),
+                torch.load(os.path.join(whole_raw_path, "cat_properties_tensor.pt"), map_location="cpu"),
+                torch.load(os.path.join(whole_raw_path, "des_tensor.pt"), map_location="cpu"),
             ],
             dim=1,
         )
-        edge_index = torch.load(os.path.join(whole_raw_path, "edge_index.pt"))
-        edge_type = torch.load(os.path.join(whole_raw_path, "edge_type.pt"))
-        edge_index, edge_type = relational_undirected(edge_index, edge_type)
-        self.args.num_relations = edge_type.max() + 1
         data = Data(x=x, edge_index=edge_index, edge_type=edge_type, y=label).to(
             self.args.device
         )
@@ -713,6 +741,10 @@ if __name__ == "__main__":
     parser.add_argument("--node_num", type=int, default=11826)
     parser.add_argument("--attribute_num", type=int, default=39)
     parser.add_argument("--num_classes", type=int, default=2)
+    parser.add_argument(
+        "--material_graph", choices=["augmented", "native"], default="augmented",
+        help="Use prepared native-plus-feature support (default); native is a construction ablation.",
+    )
 
     parser.add_argument("--feature_num", type=int, default=768)
     parser.add_argument("--des_num", type=int, default=768)
